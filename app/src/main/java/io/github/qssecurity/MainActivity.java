@@ -40,7 +40,7 @@ public final class MainActivity extends Activity {
         root.addView(title);
 
         TextView subtitle = text(
-                "LineageOS 23 / Android 16 • libxposed API 102 • v1.4\n" +
+                "LineageOS 23 / Android 16 • libxposed API 101 • v1.4.1\n" +
                 "Proteksi hanya aktif ketika keyguard/lock screen sedang terkunci.", 15);
         subtitle.setPadding(0, 0, 0, dp(24));
         root.addView(subtitle);

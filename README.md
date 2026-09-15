@@ -1,11 +1,11 @@
-# QS Security v1.4 — LineageOS 23 / Android 16
+# QS Security v1.4.1 — LineageOS 23 / Android 16
 
 Modern LSPosed/libxposed module that protects Quick Settings while the device is locked.
 
 ## Requirements
 
 - LineageOS 23 / Android 16 (API 36)
-- LSPosed-compatible framework implementing **libxposed API 102**
+- LSPosed-compatible framework implementing **libxposed API 101**
 - Secure lock screen (PIN / pattern / password; biometrics are handled by SystemUI)
 
 ## Modes
@@ -50,7 +50,7 @@ The module hooks:
 2. Upload the contents of this project to the repo root.
 3. Open **Actions → Build APK → Run workflow**.
 4. Download artifact **QS-Security-APK**.
-5. The artifact contains `QS-Security-v1.4.0.apk`.
+5. The artifact contains `QS-Security-v1.4.1.apk`.
 
 The test release is signed with the Android debug key so it can be installed directly. Keep the same signing scheme for updates to this test package, or uninstall the previous build if Android reports a signature mismatch.
 
@@ -91,8 +91,8 @@ BLOCK panel touch handleExternalTouch ...
 
 ## Project configuration
 
-- libxposed: **102.0.0**
-- min/target Xposed API: **102**
+- libxposed API: **101.0.1** / service: **101.0.0**
+- min/target Xposed API: **101**
 - compileSdk / targetSdk: **36**
 - Java: **17**
 - scope: **com.android.systemui** only
@@ -116,3 +116,8 @@ Saat mode block aktif dan keyguard terkunci, gesture dari status bar dimakan seb
 ## v1.4 configuration fix
 
 Mode selection now uses the official libxposed `RemotePreferences` channel. Earlier builds used a custom exported `ContentProvider`; when SystemUI could not read it, the hook intentionally fell back to `REQUIRE_UNLOCK`, so selecting **Block shade** could appear to behave exactly like the first mode. v1.4 removes that provider bridge.
+
+
+## v1.4.1 build fix
+
+GitHub Actions log from v1.4 showed `io.github.libxposed:service:102.0.0` and its interface dependency require `compileSdk >= 37`, while this module intentionally targets LineageOS 23 / Android 16 (`compileSdk 36`). v1.4.1 therefore uses modern libxposed API 101 instead. This still satisfies the module requirement of Xposed API > 100 and keeps the Android 16 build on SDK 36. The QS hook logic from v1.4 is unchanged.

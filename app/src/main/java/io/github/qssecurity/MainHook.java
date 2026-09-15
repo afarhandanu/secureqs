@@ -173,7 +173,7 @@ public final class MainHook extends XposedModule {
                     });
                 }
 
-                // Capture future constructor instances. Constructor hooks are supported by API 102.
+                // Capture future constructor instances using the modern libxposed hook API.
                 for (Constructor<?> ctor : clazz.getDeclaredConstructors()) {
                     makeAccessible(ctor);
                     hook(ctor).intercept(chain -> {
