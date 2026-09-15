@@ -6,8 +6,16 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.os.Bundle;
 
+/**
+ * Compatibility shim for repositories upgraded from v1.3.
+ *
+ * v1.4+ no longer uses this ContentProvider for module settings; mode synchronization is handled
+ * by libxposed RemotePreferences through QSApp/MainHook. The class remains intentionally so that
+ * uploading the new source over an older GitHub repository also overwrites the stale v1.3 source
+ * instead of leaving a Java file that references removed ModuleConfig constants.
+ */
+@Deprecated
 public final class SettingsProvider extends ContentProvider {
-
     @Override
     public boolean onCreate() {
         return true;
@@ -15,14 +23,7 @@ public final class SettingsProvider extends ContentProvider {
 
     @Override
     public Bundle call(String method, String arg, Bundle extras) {
-        if (ModuleConfig.PROVIDER_METHOD_GET_MODE.equals(method) && getContext() != null) {
-            int mode = getContext()
-                    .getSharedPreferences(ModuleConfig.PREFS, 0)
-                    .getInt(ModuleConfig.PREF_MODE, ModuleConfig.MODE_REQUIRE_UNLOCK);
-            Bundle result = new Bundle();
-            result.putInt(ModuleConfig.PROVIDER_RESULT_MODE, mode);
-            return result;
-        }
+        // Legacy provider disabled. Keep the component harmless if an old manifest still refers to it.
         return super.call(method, arg, extras);
     }
 

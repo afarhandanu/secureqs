@@ -121,3 +121,11 @@ Mode selection now uses the official libxposed `RemotePreferences` channel. Earl
 ## v1.4.1 build fix
 
 GitHub Actions log from v1.4 showed `io.github.libxposed:service:102.0.0` and its interface dependency require `compileSdk >= 37`, while this module intentionally targets LineageOS 23 / Android 16 (`compileSdk 36`). v1.4.1 therefore uses modern libxposed API 101 instead. This still satisfies the module requirement of Xposed API > 100 and keeps the Android 16 build on SDK 36. The QS hook logic from v1.4 is unchanged.
+
+## v1.4.2 build fix
+
+If this project is uploaded over an older v1.3 repository, GitHub does not automatically delete
+files that disappeared from a later ZIP. v1.3 contained `SettingsProvider.java`; v1.4+ switched to
+libxposed RemotePreferences and removed the provider constants. v1.4.2 ships a harmless compatibility
+`SettingsProvider.java` so the stale file is overwritten and the repository builds cleanly without
+changing the working Require Unlock or Block Shade hook logic.
