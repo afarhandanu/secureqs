@@ -18,5 +18,13 @@
             </intent-filter>
         </activity>
 
+        <receiver
+            android:name=".HookStatusReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="io.github.qssecurity.action.HOOK_READY" />
+            </intent-filter>
+        </receiver>
+
     </application>
 </manifest>

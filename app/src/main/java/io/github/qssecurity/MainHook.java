@@ -7,6 +7,7 @@ import android.content.SharedPreferences;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.provider.Settings;
 import android.util.Log;
 import android.view.MotionEvent;
 import android.view.View;
@@ -16,6 +17,11 @@ import java.lang.reflect.Executable;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.IdentityHashMap;
+import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import io.github.libxposed.api.XposedModule;
@@ -45,6 +51,7 @@ public final class MainHook extends XposedModule {
     private static volatile Object capturedActivityStarter;
 
     private static volatile int cachedMode = ModuleConfig.MODE_REQUIRE_UNLOCK;
+    private static volatile Set<String> cachedWhitelist = Collections.emptySet();
     private static volatile SharedPreferences remotePreferences;
     private static volatile long lastUnlockRequestAt = 0L;
     private static volatile long blockedShadeGestureDownTime = -1L;
@@ -59,6 +66,10 @@ public final class MainHook extends XposedModule {
                             ModuleConfig.PREF_MODE, ModuleConfig.MODE_REQUIRE_UNLOCK));
                     cachedMode = mode;
                     log(Log.INFO, TAG, "Remote mode changed -> " + modeName(mode));
+                    sendHookHeartbeat();
+                } else if (ModuleConfig.PREF_WHITELIST.equals(key)) {
+                    cachedWhitelist = readWhitelist(preferences);
+                    log(Log.INFO, TAG, "Remote whitelist changed -> " + cachedWhitelist);
                 }
             };
 
@@ -71,11 +82,14 @@ public final class MainHook extends XposedModule {
             remotePreferences = getRemotePreferences(ModuleConfig.REMOTE_PREF_GROUP);
             cachedMode = normalizeMode(remotePreferences.getInt(
                     ModuleConfig.PREF_MODE, ModuleConfig.MODE_REQUIRE_UNLOCK));
+            cachedWhitelist = readWhitelist(remotePreferences);
             remotePreferences.registerOnSharedPreferenceChangeListener(remotePreferenceListener);
-            log(Log.INFO, TAG, "RemotePreferences ready; mode=" + modeName(cachedMode));
+            log(Log.INFO, TAG, "RemotePreferences ready; mode=" + modeName(cachedMode)
+                    + " whitelist=" + cachedWhitelist);
         } catch (Throwable t) {
             remotePreferences = null;
             cachedMode = ModuleConfig.MODE_REQUIRE_UNLOCK;
+            cachedWhitelist = Collections.emptySet();
             log(Log.ERROR, TAG,
                     "RemotePreferences unavailable; temporary safe fallback=REQUIRE_UNLOCK", t);
         }
@@ -109,6 +123,7 @@ public final class MainHook extends XposedModule {
             installNewArchitectureHooks(cl);
             installLegacyTileHooks(cl);
             installShadeHooks(cl);
+            sendHookHeartbeat();
             log(Log.INFO, TAG, "Hook installation complete");
         } catch (Throwable t) {
             hooksInstalled.set(false);
@@ -280,6 +295,13 @@ public final class MainHook extends XposedModule {
                 return chain.proceed();
             }
 
+            Object[] currentArgs = chain.getArgs().toArray();
+            String whitelistedSpec = findWhitelistedTileSpec(target, currentArgs);
+            if (whitelistedSpec != null) {
+                log(Log.INFO, TAG, "ALLOW whitelisted tile=" + whitelistedSpec + " via " + path);
+                return chain.proceed();
+            }
+
             // We are locked: absolutely do not allow the original action into SystemUI's backend.
             // This is what the previous QSTileImpl-only implementation failed to guarantee.
             log(Log.INFO, TAG,
@@ -289,8 +311,7 @@ public final class MainHook extends XposedModule {
             long now = SystemClock.elapsedRealtime();
             if (now - lastUnlockRequestAt >= 700L) {
                 lastUnlockRequestAt = now;
-                Object[] args = chain.getArgs().toArray();
-                requestUnlockAndReplay(cl, context, target, method, args);
+                requestUnlockAndReplay(cl, context, target, method, currentArgs);
             }
             return null;
         });
@@ -857,6 +878,144 @@ public final class MainHook extends XposedModule {
         } catch (Throwable t) {
             log(Log.WARN, TAG, "Unable to read RemotePreferences; keeping " + modeName(cachedMode), t);
             return cachedMode;
+        }
+    }
+
+    private static Set<String> readWhitelist(SharedPreferences preferences) {
+        if (preferences == null) return Collections.emptySet();
+        try {
+            Set<String> value = preferences.getStringSet(
+                    ModuleConfig.PREF_WHITELIST, Collections.emptySet());
+            if (value == null || value.isEmpty()) return Collections.emptySet();
+            Set<String> copy = new HashSet<>();
+            for (String spec : value) {
+                if (spec == null) continue;
+                String normalized = spec.trim().toLowerCase(Locale.ROOT);
+                if (!normalized.isEmpty()) copy.add(normalized);
+            }
+            return Collections.unmodifiableSet(copy);
+        } catch (Throwable ignored) {
+            return Collections.emptySet();
+        }
+    }
+
+    private Set<String> getWhitelist() {
+        SharedPreferences preferences = remotePreferences;
+        if (preferences != null) {
+            try {
+                cachedWhitelist = readWhitelist(preferences);
+            } catch (Throwable ignored) {
+            }
+        }
+        return cachedWhitelist;
+    }
+
+    /**
+     * Best-effort tile-spec discovery for the optional whitelist. Failure is intentionally secure:
+     * if a ROM changes its tile model and no spec can be resolved, the tile remains protected.
+     */
+    private String findWhitelistedTileSpec(Object target, Object[] args) {
+        Set<String> whitelist = getWhitelist();
+        if (whitelist == null || whitelist.isEmpty()) return null;
+
+        Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<>());
+        String found = scanObjectForWhitelistedSpec(target, whitelist, visited, 0);
+        if (found != null) return found;
+
+        if (args != null) {
+            for (Object arg : args) {
+                found = scanObjectForWhitelistedSpec(arg, whitelist, visited, 0);
+                if (found != null) return found;
+            }
+        }
+        return null;
+    }
+
+    private String scanObjectForWhitelistedSpec(
+            Object object, Set<String> whitelist, Set<Object> visited, int depth) {
+        if (object == null || depth > 2) return null;
+
+        if (object instanceof String) {
+            return matchWhitelistCandidate((String) object, whitelist);
+        }
+
+        Class<?> type = object.getClass();
+        if (type.isPrimitive() || type.isEnum() || type.getName().startsWith("java.")) {
+            return null;
+        }
+        if (!visited.add(object)) return null;
+
+        // Stable property names used by both legacy QSTileImpl and newer ViewModel/config models.
+        for (String methodName : new String[]{"getTileSpec", "getSpec"}) {
+            try {
+                Method method = type.getMethod(methodName);
+                if (method.getParameterCount() == 0) {
+                    makeAccessible(method);
+                    Object value = method.invoke(object);
+                    String found = scanObjectForWhitelistedSpec(
+                            value, whitelist, visited, depth + 1);
+                    if (found != null) return found;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+
+        for (Class<?> c = type; c != null && depth <= 2; c = c.getSuperclass()) {
+            for (Field field : c.getDeclaredFields()) {
+                String name = field.getName().toLowerCase(Locale.ROOT);
+                if (!(name.contains("tilespec") || name.equals("spec")
+                        || name.contains("config") || name.equals("tileSpec".toLowerCase(Locale.ROOT)))) {
+                    continue;
+                }
+                try {
+                    makeAccessible(field);
+                    Object value = field.get(object);
+                    if (value == null) continue;
+
+                    if (value instanceof String) {
+                        String found = matchWhitelistCandidate((String) value, whitelist);
+                        if (found != null) return found;
+                    } else {
+                        String direct = matchWhitelistCandidate(String.valueOf(value), whitelist);
+                        if (direct != null) return direct;
+                        String found = scanObjectForWhitelistedSpec(
+                                value, whitelist, visited, depth + 1);
+                        if (found != null) return found;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        return null;
+    }
+
+    private String matchWhitelistCandidate(String candidate, Set<String> whitelist) {
+        if (candidate == null) return null;
+        String lower = candidate.trim().toLowerCase(Locale.ROOT);
+        if (lower.isEmpty()) return null;
+        if (whitelist.contains(lower)) return lower;
+
+        // Handles representations such as PlatformTileSpec(spec=internet).
+        String[] tokens = lower.replaceAll("[^a-z0-9_]+", " ").trim().split("\\s+");
+        for (String token : tokens) {
+            if (whitelist.contains(token)) return token;
+        }
+        return null;
+    }
+
+    private void sendHookHeartbeat() {
+        Context context = systemUiContext;
+        if (context == null) return;
+        try {
+            int bootCount = Settings.Global.getInt(
+                    context.getContentResolver(), Settings.Global.BOOT_COUNT, -1);
+            Intent intent = new Intent(ModuleConfig.ACTION_HOOK_READY);
+            intent.setPackage(ModuleConfig.APP_PACKAGE);
+            intent.putExtra("boot_count", bootCount);
+            intent.putExtra("version", ModuleConfig.VERSION_NAME);
+            context.sendBroadcast(intent);
+        } catch (Throwable t) {
+            log(Log.DEBUG, TAG, "Unable to send hook heartbeat", t);
         }
     }
 

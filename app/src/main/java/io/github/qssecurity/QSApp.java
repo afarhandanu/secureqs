@@ -5,17 +5,14 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.util.Log;
 
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
+
 import io.github.libxposed.service.XposedService;
 import io.github.libxposed.service.XposedServiceHelper;
 
-/**
- * Module application side of the official libxposed RemotePreferences bridge.
- *
- * The old build used our own exported ContentProvider. On this device that bridge could fail and
- * MainHook deliberately fell back to MODE_REQUIRE_UNLOCK, which made "block shade" behave exactly
- * like the first mode. RemotePreferences avoids cross-app provider/SELinux/user-routing issues and
- * is the configuration channel designed for modern libxposed modules.
- */
+/** Module application side of the official libxposed RemotePreferences bridge. */
 public final class QSApp extends Application implements XposedServiceHelper.OnServiceListener {
 
     private static final String TAG = "QSSecurityApp";
@@ -35,12 +32,19 @@ public final class QSApp extends Application implements XposedServiceHelper.OnSe
             SharedPreferences remote = service.getRemotePreferences(ModuleConfig.REMOTE_PREF_GROUP);
             remotePreferences = remote;
 
-            // Preserve the user's setting from v1.0-v1.3. Those versions saved it locally.
+            // Preserve settings from previous versions and push them into RemotePreferences.
             SharedPreferences local = getSharedPreferences(ModuleConfig.PREFS, MODE_PRIVATE);
             int localMode = normalizeMode(local.getInt(
                     ModuleConfig.PREF_MODE, ModuleConfig.MODE_REQUIRE_UNLOCK));
-            remote.edit().putInt(ModuleConfig.PREF_MODE, localMode).apply();
-            Log.i(TAG, "LSPosed service connected; remote mode synced=" + localMode);
+            Set<String> whitelist = new HashSet<>(local.getStringSet(
+                    ModuleConfig.PREF_WHITELIST, Collections.emptySet()));
+
+            remote.edit()
+                    .putInt(ModuleConfig.PREF_MODE, localMode)
+                    .putStringSet(ModuleConfig.PREF_WHITELIST, whitelist)
+                    .apply();
+            Log.i(TAG, "LSPosed service connected; settings synced. mode=" + localMode
+                    + " whitelist=" + whitelist);
         } catch (Throwable t) {
             Log.e(TAG, "Unable to initialize libxposed RemotePreferences", t);
         }
@@ -59,6 +63,11 @@ public final class QSApp extends Application implements XposedServiceHelper.OnSe
                 .getInt(ModuleConfig.PREF_MODE, ModuleConfig.MODE_REQUIRE_UNLOCK));
     }
 
+    public static Set<String> getLocalWhitelist(Context context) {
+        return new HashSet<>(context.getSharedPreferences(ModuleConfig.PREFS, MODE_PRIVATE)
+                .getStringSet(ModuleConfig.PREF_WHITELIST, Collections.emptySet()));
+    }
+
     /** Save locally for UI/migration and to LSPosed RemotePreferences for SystemUI. */
     public static boolean saveMode(Context context, int mode) {
         int normalized = normalizeMode(mode);
@@ -74,6 +83,24 @@ public final class QSApp extends Application implements XposedServiceHelper.OnSe
             return true;
         } catch (Throwable t) {
             Log.e(TAG, "Unable to write remote mode=" + normalized, t);
+            return false;
+        }
+    }
+
+    public static boolean saveWhitelist(Context context, Set<String> whitelist) {
+        Set<String> copy = new HashSet<>(whitelist);
+        context.getSharedPreferences(ModuleConfig.PREFS, MODE_PRIVATE)
+                .edit()
+                .putStringSet(ModuleConfig.PREF_WHITELIST, copy)
+                .apply();
+
+        SharedPreferences remote = remotePreferences;
+        if (remote == null) return false;
+        try {
+            remote.edit().putStringSet(ModuleConfig.PREF_WHITELIST, copy).apply();
+            return true;
+        } catch (Throwable t) {
+            Log.e(TAG, "Unable to write whitelist=" + copy, t);
             return false;
         }
     }
