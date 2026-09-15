@@ -4,8 +4,12 @@ import android.app.KeyguardManager;
 import android.content.Context;
 import android.content.Intent;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.util.Log;
+import android.view.MotionEvent;
+import android.view.View;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Executable;
@@ -33,6 +37,8 @@ public final class MainHook extends XposedModule {
 
     private static final String TAG = "QSSecurity";
     private static final long MODE_CACHE_MS = 500L;
+    private static final long UNLOCK_WATCH_TIMEOUT_MS = 15_000L;
+    private static final long UNLOCK_WATCH_INTERVAL_MS = 80L;
 
     private static final AtomicBoolean earlyCaptureInstalled = new AtomicBoolean(false);
     private static final AtomicBoolean hooksInstalled = new AtomicBoolean(false);
@@ -42,6 +48,7 @@ public final class MainHook extends XposedModule {
     private static volatile int cachedMode = ModuleConfig.MODE_REQUIRE_UNLOCK;
     private static volatile long cachedModeAt = Long.MIN_VALUE;
     private static volatile long lastUnlockRequestAt = 0L;
+    private static volatile long blockedShadeGestureDownTime = -1L;
 
     /** A replay must not immediately get intercepted by another synchronous hook layer. */
     private static final ThreadLocal<Boolean> authenticatedReplay = new ThreadLocal<>();
@@ -242,23 +249,38 @@ public final class MainHook extends XposedModule {
             Method method,
             Object[] args) {
 
-        Runnable replay = () -> {
+        final AtomicBoolean replayConsumed = new AtomicBoolean(false);
+
+        Runnable replayOnce = () -> {
+            if (!replayConsumed.compareAndSet(false, true)) return;
+
             authenticatedReplay.set(Boolean.TRUE);
             try {
-                // If the device is somehow still locked, do not execute a sensitive action.
-                if (context != null && isKeyguardLocked(context)) {
-                    log(Log.WARN, TAG, "Replay skipped: keyguard still locked");
+                Context currentContext = context != null ? context : systemUiContext;
+                if (currentContext != null && isKeyguardLocked(currentContext)) {
+                    // A native callback can occasionally arrive slightly before the keyguard state
+                    // settles. Give the watcher the right to replay instead.
+                    replayConsumed.set(false);
+                    log(Log.DEBUG, TAG, "Native replay arrived while keyguard still locked; watcher retained");
                     return;
                 }
+
                 makeAccessible(method);
                 method.invoke(target, args);
-                log(Log.INFO, TAG, "Authenticated QS action replayed");
+                log(Log.INFO, TAG, "Authenticated QS action replayed: "
+                        + method.getDeclaringClass().getSimpleName() + "#" + method.getName());
             } catch (Throwable t) {
                 log(Log.ERROR, TAG, "Authenticated QS replay failed", t);
             } finally {
                 authenticatedReplay.remove();
             }
         };
+
+        // Independent safety net. This is intentionally installed BEFORE requesting the bouncer.
+        // Some Android 16 / Lineage SystemUI builds dismiss the keyguard correctly but do not run
+        // postQSRunnableDismissingKeyguard() for third-party module callbacks. Once KeyguardManager
+        // reports the device unlocked, replay exactly once.
+        watchForUnlock(context, replayOnce, replayConsumed);
 
         try {
             Object starter = findActivityStarter(cl, target);
@@ -267,8 +289,8 @@ public final class MainHook extends XposedModule {
                         "postQSRunnableDismissingKeyguard");
                 if (post != null) {
                     makeAccessible(post);
-                    post.invoke(starter, replay);
-                    log(Log.INFO, TAG, "Native SystemUI keyguard bouncer requested");
+                    post.invoke(starter, replayOnce);
+                    log(Log.INFO, TAG, "Native SystemUI keyguard bouncer requested + replay armed");
                     return;
                 }
             }
@@ -276,9 +298,40 @@ public final class MainHook extends XposedModule {
             log(Log.WARN, TAG, "Native ActivityStarter path failed", t);
         }
 
-        // Safe fallback: action remains blocked. The credential confirmation is shown, but we never
-        // execute the QS action while KeyguardManager still reports the device as locked.
+        // Fallback still gets replay semantics through watchForUnlock().
         requestCredentialFallback(context);
+    }
+
+    private void watchForUnlock(
+            Context initialContext,
+            Runnable replayOnce,
+            AtomicBoolean replayConsumed) {
+
+        Handler handler = new Handler(Looper.getMainLooper());
+        long deadline = SystemClock.elapsedRealtime() + UNLOCK_WATCH_TIMEOUT_MS;
+
+        Runnable watcher = new Runnable() {
+            @Override
+            public void run() {
+                if (replayConsumed.get()) return;
+
+                Context context = initialContext != null ? initialContext : systemUiContext;
+                if (context != null && !isKeyguardLocked(context)) {
+                    log(Log.INFO, TAG, "UNLOCK detected by watcher; replaying pending QS action");
+                    replayOnce.run();
+                    return;
+                }
+
+                if (SystemClock.elapsedRealtime() >= deadline) {
+                    log(Log.INFO, TAG, "Pending QS replay expired (unlock cancelled/timed out)");
+                    return;
+                }
+
+                handler.postDelayed(this, UNLOCK_WATCH_INTERVAL_MS);
+            }
+        };
+
+        handler.post(watcher);
     }
 
     private Object findActivityStarter(ClassLoader cl, Object target) {
@@ -367,7 +420,8 @@ public final class MainHook extends XposedModule {
     private void installShadeHooks(ClassLoader cl) {
         int total = 0;
 
-        // Generic notification-panel gate.
+        // Generic policy gate. Useful for programmatic expansion paths, but NOT sufficient by
+        // itself on Android 16 because the migrated lockscreen shade can dispatch touch directly.
         try {
             Class<?> clazz = cl.loadClass("com.android.systemui.statusbar.CommandQueue");
             Method m = clazz.getDeclaredMethod("panelsEnabled");
@@ -386,7 +440,129 @@ public final class MainHook extends XposedModule {
             log(Log.DEBUG, TAG, "CommandQueue.panelsEnabled unavailable", t);
         }
 
-        // QS-specific Android 16 interception gate used by the shade controller.
+        // Status-bar hard gate. A top-edge pull can be routed through PhoneStatusBarView before
+        // focus is transferred to the shade. Eating its touch stream while locked prevents that
+        // transfer on builds where the shade root does not receive the initial ACTION_DOWN.
+        try {
+            Class<?> statusBarView = cl.loadClass(
+                    "com.android.systemui.statusbar.phone.PhoneStatusBarView");
+            for (Method m : statusBarView.getDeclaredMethods()) {
+                if (!(m.getName().equals("onTouchEvent") || m.getName().equals("dispatchTouchEvent"))
+                        || m.getReturnType() != boolean.class
+                        || m.getParameterCount() != 1
+                        || !MotionEvent.class.isAssignableFrom(m.getParameterTypes()[0])) {
+                    continue;
+                }
+                makeAccessible(m);
+                hook(m).intercept(chain -> {
+                    MotionEvent ev = (MotionEvent) chain.getArgs().get(0);
+                    Context context = extractContext(chain.getThisObject());
+                    rememberContext(context);
+                    if (shouldBlockShade(context != null ? context : systemUiContext)) {
+                        log(Log.DEBUG, TAG, "BLOCK status-bar touch " + m.getName()
+                                + " action=" + ev.getActionMasked());
+                        return true;
+                    }
+                    return chain.proceed();
+                });
+                total++;
+            }
+        } catch (Throwable t) {
+            log(Log.DEBUG, TAG, "PhoneStatusBarView touch hook unavailable", t);
+        }
+
+        // Android 16 migrated shade hard gate. NotificationShadeWindowView is the parent window
+        // through which lockscreen shade touch is dispatched on the new hierarchy. Consuming a
+        // gesture that STARTS in the top edge prevents QS pull-down while preserving notification
+        // taps and normal swipe-up-to-unlock gestures lower on the lockscreen.
+        try {
+            Class<?> rootView = cl.loadClass("com.android.systemui.shade.NotificationShadeWindowView");
+            for (Method m : rootView.getDeclaredMethods()) {
+                if (!m.getName().equals("dispatchTouchEvent")
+                        || m.getReturnType() != boolean.class
+                        || m.getParameterCount() != 1
+                        || !MotionEvent.class.isAssignableFrom(m.getParameterTypes()[0])) {
+                    continue;
+                }
+                makeAccessible(m);
+                hook(m).intercept(chain -> {
+                    MotionEvent ev = (MotionEvent) chain.getArgs().get(0);
+                    Context context = extractContext(chain.getThisObject());
+                    rememberContext(context);
+                    if (shouldConsumeBlockedShadeGesture(context, ev)) {
+                        log(Log.DEBUG, TAG, "BLOCK shade root dispatch action=" + ev.getActionMasked());
+                        return true;
+                    }
+                    return chain.proceed();
+                });
+                total++;
+            }
+        } catch (Throwable t) {
+            log(Log.DEBUG, TAG, "NotificationShadeWindowView dispatch hook unavailable", t);
+        }
+
+        // NotificationPanelViewController owns both legacy onTouchEvent() and the Android 16
+        // migrated handleExternalTouch()/handleExternalInterceptTouch() path. Hook all known touch
+        // entry points as a second line of defense for Lineage-specific hierarchy differences.
+        String[] panelNames = {
+                "com.android.systemui.shade.NotificationPanelViewController",
+                "com.android.systemui.statusbar.phone.NotificationPanelViewController"
+        };
+        String[] touchNames = {
+                "onTouch",
+                "onTouchEvent",
+                "onInterceptTouchEvent",
+                "handleTouch",
+                "handleExternalTouch",
+                "handleExternalInterceptTouch"
+        };
+        for (String name : panelNames) {
+            try {
+                Class<?> clazz = cl.loadClass(name);
+                for (Method m : clazz.getDeclaredMethods()) {
+                    boolean nameMatch = false;
+                    for (String touchName : touchNames) {
+                        if (m.getName().equals(touchName)) {
+                            nameMatch = true;
+                            break;
+                        }
+                    }
+                    if (!nameMatch) continue;
+
+                    int motionIndex = findMotionEventParameter(m);
+                    if (motionIndex < 0) continue;
+
+                    Class<?> returnType = m.getReturnType();
+                    if (!(returnType == boolean.class || returnType == Boolean.class
+                            || returnType == void.class)) {
+                        continue;
+                    }
+
+                    makeAccessible(m);
+                    final int eventIndex = motionIndex;
+                    hook(m).intercept(chain -> {
+                        MotionEvent ev = (MotionEvent) chain.getArgs().get(eventIndex);
+                        Context context = extractContext(chain.getThisObject());
+                        rememberContext(context);
+                        if (shouldConsumeBlockedShadeGesture(context, ev)) {
+                            log(Log.DEBUG, TAG, "BLOCK panel touch " + m.getName()
+                                    + " action=" + ev.getActionMasked());
+                            if (returnType == boolean.class || returnType == Boolean.class) {
+                                return true;
+                            }
+                            return null;
+                        }
+                        return chain.proceed();
+                    });
+                    total++;
+                }
+            } catch (Throwable t) {
+                log(Log.DEBUG, TAG, "Panel touch class unavailable: " + name, t);
+            }
+        }
+
+        // QS-specific interception gate remains useful on ROMs that haven't enabled the full
+        // notification shade migration.
         String[] quickControllerNames = {
                 "com.android.systemui.shade.QuickSettingsControllerImpl",
                 "com.android.systemui.shade.QuickSettingsController"
@@ -399,7 +575,12 @@ public final class MainHook extends XposedModule {
                             || m.getReturnType() != boolean.class) continue;
                     makeAccessible(m);
                     hook(m).intercept(chain -> {
-                        if (shouldBlockShade(systemUiContext)) return false;
+                        Context context = extractContext(chain.getThisObject());
+                        rememberContext(context);
+                        if (shouldBlockShade(context != null ? context : systemUiContext)) {
+                            log(Log.DEBUG, TAG, "BLOCK shouldQuickSettingsIntercept");
+                            return false;
+                        }
                         return chain.proceed();
                     });
                     total++;
@@ -408,21 +589,20 @@ public final class MainHook extends XposedModule {
             }
         }
 
-        // Expansion methods: if ROM bypasses the generic panel gate, neutralize direct QS expansion.
-        String[] expansionClasses = {
-                "com.android.systemui.shade.NotificationPanelViewController",
-                "com.android.systemui.statusbar.phone.NotificationPanelViewController"
-        };
-        for (String name : expansionClasses) {
+        // Programmatic/direct expansion fallback.
+        for (String name : panelNames) {
             try {
                 Class<?> clazz = cl.loadClass(name);
                 for (Method m : clazz.getDeclaredMethods()) {
                     String n = m.getName();
-                    if (!(n.equals("expandToQs") || n.equals("expandQs"))) continue;
+                    if (!(n.equals("expandToQs") || n.equals("expandQs")
+                            || n.equals("expandWithQs"))) continue;
                     if (m.getReturnType() != void.class) continue;
                     makeAccessible(m);
                     hook(m).intercept(chain -> {
-                        if (shouldBlockShade(systemUiContext)) {
+                        Context context = extractContext(chain.getThisObject());
+                        rememberContext(context);
+                        if (shouldBlockShade(context != null ? context : systemUiContext)) {
                             log(Log.DEBUG, TAG, "BLOCK direct QS expansion " + n);
                             return null;
                         }
@@ -435,6 +615,56 @@ public final class MainHook extends XposedModule {
         }
 
         log(Log.INFO, TAG, "Shade/QS expansion hooks=" + total);
+    }
+
+    private int findMotionEventParameter(Method method) {
+        Class<?>[] types = method.getParameterTypes();
+        for (int i = 0; i < types.length; i++) {
+            if (MotionEvent.class.isAssignableFrom(types[i])) return i;
+        }
+        return -1;
+    }
+
+    private boolean shouldConsumeBlockedShadeGesture(Context context, MotionEvent event) {
+        if (context == null || event == null || !shouldBlockShade(context)) {
+            if (event != null && (event.getActionMasked() == MotionEvent.ACTION_UP
+                    || event.getActionMasked() == MotionEvent.ACTION_CANCEL)) {
+                blockedShadeGestureDownTime = -1L;
+            }
+            return false;
+        }
+
+        int action = event.getActionMasked();
+        if (action == MotionEvent.ACTION_DOWN) {
+            if (isTopEdgeGesture(context, event)) {
+                blockedShadeGestureDownTime = event.getDownTime();
+                log(Log.INFO, TAG, "BLOCK_SHADE gesture armed y=" + event.getY());
+                return true;
+            }
+            blockedShadeGestureDownTime = -1L;
+            return false;
+        }
+
+        boolean blocked = blockedShadeGestureDownTime == event.getDownTime();
+        if (blocked && (action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_CANCEL)) {
+            blockedShadeGestureDownTime = -1L;
+        }
+        return blocked;
+    }
+
+    private boolean isTopEdgeGesture(Context context, MotionEvent event) {
+        float density = context.getResources().getDisplayMetrics().density;
+        int statusBarHeight = 0;
+        try {
+            int id = context.getResources().getIdentifier("status_bar_height", "dimen", "android");
+            if (id != 0) statusBarHeight = context.getResources().getDimensionPixelSize(id);
+        } catch (Throwable ignored) {
+        }
+
+        // Intentionally generous enough for cutouts / large status bars, but small enough to keep
+        // lockscreen notifications and swipe-up-to-unlock outside the consumed region.
+        float thresholdPx = Math.max(statusBarHeight * 2.5f, 96f * density);
+        return event.getY() <= thresholdPx;
     }
 
     private boolean shouldRequireUnlock(Context context) {
@@ -498,7 +728,15 @@ public final class MainHook extends XposedModule {
 
     private Context extractContext(Object object) {
         if (object instanceof Context) return (Context) object;
+        if (object instanceof View) return ((View) object).getContext();
         if (object == null) return null;
+
+        try {
+            Method getContext = object.getClass().getMethod("getContext");
+            Object value = getContext.invoke(object);
+            if (value instanceof Context) return (Context) value;
+        } catch (Throwable ignored) {
+        }
 
         for (Class<?> c = object.getClass(); c != null; c = c.getSuperclass()) {
             for (Field field : c.getDeclaredFields()) {

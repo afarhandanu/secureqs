@@ -1,101 +1,99 @@
-# QS Security v1.1 — LineageOS 23 / Android 16
-
+# QS Security v1.2 — LineageOS 23 / Android 16
 
 Modern LSPosed/libxposed module that protects Quick Settings while the device is locked.
 
 ## Requirements
 
 - LineageOS 23 / Android 16 (API 36)
-- An LSPosed-compatible framework implementing **libxposed API 102**
-- Secure lock screen recommended (PIN / pattern / password; biometric behavior is controlled by SystemUI)
+- LSPosed-compatible framework implementing **libxposed API 102**
+- Secure lock screen (PIN / pattern / password; biometrics are handled by SystemUI)
 
 ## Modes
 
 ### 1. Require unlock for QS tile actions
 
-The notification shade / Quick Settings can still be opened while locked.
-Primary click, secondary/toggle click, and long-click entry points are intercepted.
-SystemUI's own `ActivityStarter.postQSRunnableDismissingKeyguard()` is used where available.
-After successful keyguard authentication, the exact original tile action is replayed once.
+Quick Settings can still be opened while locked. Primary click, secondary click and long-click are intercepted on both the legacy and Android 16 QS paths.
 
-Fallback behavior on ROMs where ActivityStarter cannot be resolved: Android's device-credential
-screen is opened, then the user taps the tile again.
+When a protected tile is tapped:
 
-### 2. Block shade while locked
+1. The original tile action is blocked.
+2. SystemUI's native keyguard bouncer is requested where available.
+3. A 15-second unlock watcher is armed at the same time.
+4. As soon as Android reports that keyguard is actually dismissed, the **exact intercepted tile action is replayed once**.
+5. If authentication is cancelled, the queued action expires and is not executed.
 
-While keyguard is locked, `CommandQueue.panelsEnabled()` is forced to `false` and two additional
-AOSP/Lineage fallback gates are also protected. The panel becomes available normally as soon as
-the device is unlocked.
+The unlock watcher fixes ROMs where the bouncer appears and unlock succeeds but `postQSRunnableDismissingKeyguard()` never runs a module-provided callback.
 
-This mode intentionally blocks the **whole notification shade**, not only the tile grid.
+### 2. Block QS / shade pull-down while locked
 
-## Android 16 tile compatibility
+The module blocks the top-edge touch stream before Android can transfer it into the shade. It covers:
 
-The module hooks both:
+- `PhoneStatusBarView` top-bar touch routing
+- `NotificationShadeWindowView.dispatchTouchEvent()`
+- `NotificationPanelViewController` legacy touch methods
+- Android 16 `handleExternalTouch()` / `handleExternalInterceptTouch()` migration paths
+- `CommandQueue.panelsEnabled()` and direct-QS expansion fallbacks
 
-- Legacy/current `com.android.systemui.qs.tileimpl.QSTileImpl`
-- Android's newer `QSTileViewModelAdapter` compatibility layer when present
+Only the top-edge shade gesture is consumed at the shade root, so normal lockscreen content lower on the screen (notifications / swipe-up-to-unlock) is not intentionally disabled. The panel works normally again immediately after keyguard is unlocked.
 
-Third-party Quick Settings tiles are also normally represented through SystemUI's `CustomTile`,
-which inherits the legacy QSTile path.
+## Android 16 QS compatibility
+
+The module hooks:
+
+- `com.android.systemui.qs.tileimpl.QSTileImpl`
+- `QSTileViewModelAdapter` variants
+- `com.android.systemui.qs.tiles.base.viewmodel.QSTileViewModelImpl#onActionPerformed`
 
 ## Build on GitHub
 
-1. Create a new GitHub repository.
-2. Upload the contents of this project (not the outer ZIP folder if you extracted it).
+1. Create/open your GitHub repository.
+2. Upload the contents of this project to the repo root.
 3. Open **Actions → Build APK → Run workflow**.
-4. After the workflow completes, download artifact **QS-Security-APK**.
-5. It contains `QS-Security-v1.0.0.apk`.
+4. Download artifact **QS-Security-APK**.
+5. The artifact contains `QS-Security-v1.2.0.apk`.
 
-The release build is signed with Android's generated debug key so the artifact is directly
-installable for personal testing. If you later publish updates publicly, replace this with your
-own persistent release keystore.
+The test release is signed with the Android debug key so it can be installed directly. Keep the same signing scheme for updates to this test package, or uninstall the previous build if Android reports a signature mismatch.
 
 ## Install / activate
 
 1. Install the APK.
-2. Open **QS Security** and choose one of the two modes.
-3. In LSPosed, enable the module. Its static scope is only:
-   `com.android.systemui`
-4. Restart SystemUI or reboot once after enabling/updating the hook.
-5. Changing modes later does not require reboot; SystemUI reads the app's read-only settings
-   provider with a short cache (under one second).
+2. Enable the module in LSPosed.
+3. Scope only **System UI (`com.android.systemui`)**.
+4. Reboot once after replacing the module APK.
+5. Open QS Security and select one of the two modes.
 
-## Troubleshooting
+Mode changes are read by SystemUI with a short cache, so normally they do not require another reboot.
 
-Check LSPosed logs for tag `QSSecurity`. On a compatible Android 16 build you should see entries
-similar to:
-
-- `SystemUI ready; installing hooks`
-- `Hooked CommandQueue.panelsEnabled`
-- `Legacy QSTileImpl action hooks: ...`
-- optionally `New-arch adapter hooks ...`
-
-If a ROM fork renames a SystemUI class, the module fails that specific fallback hook rather than
-crashing SystemUI (`exceptionMode=protective`).
-
-## Project choices
-
-- libxposed API: **102.0.0**
-- min/target Xposed API: **102**
-- Android compile/target SDK: **36**
-- SystemUI-only scope
-- No legacy `assets/xposed_init`
-
-
-## v1.1 fix
-
-Android 16 migrates Quick Settings from legacy `QSTileImpl` to the new ViewModel architecture.
-This version blocks both paths:
-
-- `QSTileImpl.click/secondaryClick/longClick` (legacy)
-- `QSTileViewModelAdapter.click/secondaryClick/longClick` (migration adapter)
-- `QSTileViewModelImpl.onActionPerformed` (new architecture hard gate)
-
-Useful log check after reboot:
+## Runtime log test
 
 ```sh
-adb logcat -d | grep -i QSSecurity
+adb logcat -c
+adb logcat | grep -i QSSecurity
 ```
 
-When a locked tile press is intercepted you should see a line beginning with `BLOCK`.
+For mode 1, after tapping a locked tile and authenticating, expected lines include:
+
+```text
+BLOCK NEW_VM ...
+Native SystemUI keyguard bouncer requested + replay armed
+UNLOCK detected by watcher; replaying pending QS action
+Authenticated QS action replayed: ...
+```
+
+For mode 2, a pull from the top while locked should produce one or more of:
+
+```text
+BLOCK status-bar touch ...
+BLOCK_SHADE gesture armed ...
+BLOCK shade root dispatch ...
+BLOCK panel touch handleExternalTouch ...
+```
+
+## Project configuration
+
+- libxposed: **102.0.0**
+- min/target Xposed API: **102**
+- compileSdk / targetSdk: **36**
+- Java: **17**
+- scope: **com.android.systemui** only
+- modern `META-INF/xposed/*` module metadata
