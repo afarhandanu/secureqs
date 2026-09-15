@@ -82,6 +82,7 @@ public final class MainHook extends XposedModule {
 
         log(Log.INFO, TAG, "Installing final SystemUI hooks from onPackageReady");
         try {
+            captureSystemUiContext(cl);
             if (!earlyCaptureInstalled.get()) installActivityStarterCapture(cl);
             installNewArchitectureHooks(cl);
             installLegacyTileHooks(cl);
@@ -98,6 +99,37 @@ public final class MainHook extends XposedModule {
      * want: show the keyguard bouncer and execute our queued tile action only after successful
      * dismissal/authentication.
      */
+    /** Capture the SystemUI Application context before any shade gesture occurs. */
+    private void captureSystemUiContext(ClassLoader cl) {
+        if (systemUiContext != null) return;
+        try {
+            Class<?> activityThread = cl.loadClass("android.app.ActivityThread");
+            Method currentApplication = activityThread.getDeclaredMethod("currentApplication");
+            makeAccessible(currentApplication);
+            Object app = currentApplication.invoke(null);
+            if (app instanceof Context) {
+                rememberContext((Context) app);
+                log(Log.INFO, TAG, "Captured SystemUI application context");
+                return;
+            }
+        } catch (Throwable t) {
+            log(Log.DEBUG, TAG, "ActivityThread.currentApplication unavailable", t);
+        }
+
+        try {
+            Class<?> appGlobals = cl.loadClass("android.app.AppGlobals");
+            Method getInitialApplication = appGlobals.getDeclaredMethod("getInitialApplication");
+            makeAccessible(getInitialApplication);
+            Object app = getInitialApplication.invoke(null);
+            if (app instanceof Context) {
+                rememberContext((Context) app);
+                log(Log.INFO, TAG, "Captured SystemUI context from AppGlobals");
+            }
+        } catch (Throwable t) {
+            log(Log.DEBUG, TAG, "AppGlobals context fallback unavailable", t);
+        }
+    }
+
     private void installActivityStarterCapture(ClassLoader cl) {
         String[] names = {
                 "com.android.systemui.statusbar.phone.ActivityStarterImpl"
@@ -440,6 +472,97 @@ public final class MainHook extends XposedModule {
             log(Log.DEBUG, TAG, "CommandQueue.panelsEnabled unavailable", t);
         }
 
+        // Android 16 QPR2 uses CentralSurfaces#getCommandQueuePanelsEnabled() from the
+        // PhoneStatusBarView touch handler. Hook this public policy accessor directly too; some
+        // Lineage builds do not call CommandQueue#panelsEnabled() on the same path we hooked above.
+        try {
+            Class<?> central = cl.loadClass(
+                    "com.android.systemui.statusbar.phone.CentralSurfacesImpl");
+            for (Method m : central.getDeclaredMethods()) {
+                if (!m.getName().equals("getCommandQueuePanelsEnabled")
+                        || m.getParameterCount() != 0
+                        || m.getReturnType() != boolean.class) {
+                    continue;
+                }
+                makeAccessible(m);
+                hook(m).intercept(chain -> {
+                    Context context = extractContext(chain.getThisObject());
+                    if (context == null) context = systemUiContext;
+                    rememberContext(context);
+                    if (shouldBlockShade(context)) {
+                        log(Log.DEBUG, TAG, "BLOCK CentralSurfaces#getCommandQueuePanelsEnabled");
+                        return false;
+                    }
+                    return chain.proceed();
+                });
+                total++;
+            }
+        } catch (Throwable t) {
+            log(Log.DEBUG, TAG, "CentralSurfaces panel gate unavailable", t);
+        }
+
+        // On Android 16 the actual finger stream from the status bar is owned by the private
+        // PhoneStatusBarViewController.PhoneStatusBarViewTouchHandler (Gefingerpoken), not by
+        // PhoneStatusBarView itself.  Hook every nested class exposing the two touch callbacks so
+        // this also survives minor Lineage/Kotlin naming changes.  Returning true eats the status
+        // bar gesture before SceneContainer/NotificationPanel ever receives it.
+        try {
+            Class<?> controller = cl.loadClass(
+                    "com.android.systemui.statusbar.phone.PhoneStatusBarViewController");
+            for (Class<?> nested : controller.getDeclaredClasses()) {
+                for (Method m : nested.getDeclaredMethods()) {
+                    String n = m.getName();
+                    if (!(n.equals("onInterceptTouchEvent") || n.equals("onTouchEvent"))
+                            || m.getReturnType() != boolean.class
+                            || m.getParameterCount() != 1
+                            || !MotionEvent.class.isAssignableFrom(m.getParameterTypes()[0])) {
+                        continue;
+                    }
+                    makeAccessible(m);
+                    hook(m).intercept(chain -> {
+                        Context context = systemUiContext;
+                        if (context == null) context = extractContext(chain.getThisObject());
+                        rememberContext(context);
+                        if (shouldBlockShade(context)) {
+                            MotionEvent ev = (MotionEvent) chain.getArgs().get(0);
+                            log(Log.INFO, TAG, "BLOCK status-bar handler "
+                                    + nested.getSimpleName() + "#" + n
+                                    + " action=" + ev.getActionMasked());
+                            return true;
+                        }
+                        return chain.proceed();
+                    });
+                    total++;
+                }
+            }
+
+            // External status-bar touch forwarding uses this method on some configurations.
+            for (Method m : controller.getDeclaredMethods()) {
+                if (!m.getName().equals("sendTouchToView")
+                        || m.getReturnType() != boolean.class
+                        || m.getParameterCount() != 1
+                        || !MotionEvent.class.isAssignableFrom(m.getParameterTypes()[0])) {
+                    continue;
+                }
+                makeAccessible(m);
+                hook(m).intercept(chain -> {
+                    Context context = systemUiContext;
+                    if (context == null) context = extractContext(chain.getThisObject());
+                    rememberContext(context);
+                    if (shouldBlockShade(context)) {
+                        MotionEvent ev = (MotionEvent) chain.getArgs().get(0);
+                        log(Log.INFO, TAG, "BLOCK PhoneStatusBarViewController#sendTouchToView action="
+                                + ev.getActionMasked());
+                        return true;
+                    }
+                    return chain.proceed();
+                });
+                total++;
+            }
+        } catch (Throwable t) {
+            log(Log.DEBUG, TAG, "PhoneStatusBarViewController hard gate unavailable", t);
+        }
+
         // Status-bar hard gate. A top-edge pull can be routed through PhoneStatusBarView before
         // focus is transferred to the shade. Eating its touch stream while locked prevents that
         // transfer on builds where the shade root does not receive the initial ACTION_DOWN.
@@ -447,7 +570,9 @@ public final class MainHook extends XposedModule {
             Class<?> statusBarView = cl.loadClass(
                     "com.android.systemui.statusbar.phone.PhoneStatusBarView");
             for (Method m : statusBarView.getDeclaredMethods()) {
-                if (!(m.getName().equals("onTouchEvent") || m.getName().equals("dispatchTouchEvent"))
+                if (!(m.getName().equals("onTouchEvent")
+                        || m.getName().equals("onInterceptTouchEvent")
+                        || m.getName().equals("dispatchTouchEvent"))
                         || m.getReturnType() != boolean.class
                         || m.getParameterCount() != 1
                         || !MotionEvent.class.isAssignableFrom(m.getParameterTypes()[0])) {
@@ -664,7 +789,9 @@ public final class MainHook extends XposedModule {
         // Intentionally generous enough for cutouts / large status bars, but small enough to keep
         // lockscreen notifications and swipe-up-to-unlock outside the consumed region.
         float thresholdPx = Math.max(statusBarHeight * 2.5f, 96f * density);
-        return event.getY() <= thresholdPx;
+        float y = event.getRawY();
+        if (y < 0f) y = event.getY();
+        return y <= thresholdPx;
     }
 
     private boolean shouldRequireUnlock(Context context) {
