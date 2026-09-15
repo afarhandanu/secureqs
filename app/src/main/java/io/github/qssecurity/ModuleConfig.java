@@ -1,7 +1,5 @@
 package io.github.qssecurity;
 
-import android.net.Uri;
-
 public final class ModuleConfig {
     private ModuleConfig() {}
 
@@ -16,8 +14,6 @@ public final class ModuleConfig {
     /** Notification shade / QS cannot expand while keyguard is locked. */
     public static final int MODE_BLOCK_SHADE = 2;
 
-    public static final String PROVIDER_AUTHORITY = "io.github.qssecurity.settings";
-    public static final Uri PROVIDER_URI = Uri.parse("content://" + PROVIDER_AUTHORITY);
-    public static final String PROVIDER_METHOD_GET_MODE = "getMode";
-    public static final String PROVIDER_RESULT_MODE = "mode";
+    /** Preferences stored by LSPosed/libxposed, readable from hooked SystemUI. */
+    public static final String REMOTE_PREF_GROUP = "qs_security";
 }

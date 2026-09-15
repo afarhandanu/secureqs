@@ -26,8 +26,7 @@ public final class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        int savedMode = getSharedPreferences(ModuleConfig.PREFS, MODE_PRIVATE)
-                .getInt(ModuleConfig.PREF_MODE, ModuleConfig.MODE_REQUIRE_UNLOCK);
+        int savedMode = QSApp.getLocalMode(this);
 
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
@@ -41,7 +40,7 @@ public final class MainActivity extends Activity {
         root.addView(title);
 
         TextView subtitle = text(
-                "LineageOS 23 / Android 16 • libxposed API 102 • v1.3\n" +
+                "LineageOS 23 / Android 16 • libxposed API 102 • v1.4\n" +
                 "Proteksi hanya aktif ketika keyguard/lock screen sedang terkunci.", 15);
         subtitle.setPadding(0, 0, 0, dp(24));
         root.addView(subtitle);
@@ -86,15 +85,15 @@ public final class MainActivity extends Activity {
                     ? ModuleConfig.MODE_BLOCK_SHADE
                     : ModuleConfig.MODE_REQUIRE_UNLOCK;
 
-            getSharedPreferences(ModuleConfig.PREFS, MODE_PRIVATE)
-                    .edit()
-                    .putInt(ModuleConfig.PREF_MODE, mode)
-                    .apply();
+            boolean pushedToLsposed = QSApp.saveMode(this, mode);
 
+            String label = mode == ModuleConfig.MODE_BLOCK_SHADE
+                    ? "Mode: blok shade saat terkunci"
+                    : "Mode: minta unlock saat tile ditekan";
             Toast.makeText(this,
-                    mode == ModuleConfig.MODE_BLOCK_SHADE
-                            ? "Mode: blok shade saat terkunci"
-                            : "Mode: minta unlock saat tile ditekan",
+                    pushedToLsposed
+                            ? label + " • tersinkron ke LSPosed"
+                            : label + " • menunggu LSPosed service",
                     Toast.LENGTH_SHORT).show();
         });
 

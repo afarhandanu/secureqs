@@ -10,8 +10,8 @@ android {
         applicationId = "io.github.qssecurity"
         minSdk = 36
         targetSdk = 36
-        versionCode = 4
-        versionName = "1.3.0"
+        versionCode = 5
+        versionName = "1.4.0"
     }
 
     buildTypes {
@@ -32,4 +32,6 @@ android {
 dependencies {
     // Modern libxposed API. Framework provides this at runtime; never package it in the APK.
     compileOnly("io.github.libxposed:api:102.0.0")
+    // Module app <-> LSPosed communication for official RemotePreferences.
+    implementation("io.github.libxposed:service:102.0.0")
 }

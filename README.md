@@ -1,4 +1,4 @@
-# QS Security v1.3 — LineageOS 23 / Android 16
+# QS Security v1.4 — LineageOS 23 / Android 16
 
 Modern LSPosed/libxposed module that protects Quick Settings while the device is locked.
 
@@ -50,7 +50,7 @@ The module hooks:
 2. Upload the contents of this project to the repo root.
 3. Open **Actions → Build APK → Run workflow**.
 4. Download artifact **QS-Security-APK**.
-5. The artifact contains `QS-Security-v1.3.0.apk`.
+5. The artifact contains `QS-Security-v1.4.0.apk`.
 
 The test release is signed with the Android debug key so it can be installed directly. Keep the same signing scheme for updates to this test package, or uninstall the previous build if Android reports a signature mismatch.
 
@@ -99,9 +99,9 @@ BLOCK panel touch handleExternalTouch ...
 - modern `META-INF/xposed/*` module metadata
 
 
-## v1.3 block-shade fix
+## v1.4 block-shade fix
 
-Mode **Require unlock** dari v1.2 tidak diubah. Perubahan v1.3 hanya memperkuat mode **Block Quick Settings / notification shade** untuk Android 16/LineageOS 23:
+Mode **Require unlock** dari v1.2 tidak diubah. Perubahan v1.4 hanya memperkuat mode **Block Quick Settings / notification shade** untuk Android 16/LineageOS 23:
 
 - hook `CentralSurfacesImpl#getCommandQueuePanelsEnabled()`
 - hook `PhoneStatusBarViewController` nested `Gefingerpoken` touch handler (`onInterceptTouchEvent`/`onTouchEvent`)
@@ -111,3 +111,8 @@ Mode **Require unlock** dari v1.2 tidak diubah. Perubahan v1.3 hanya memperkuat 
 - top-edge fallback memakai `rawY` agar tidak salah koordinat pada window/status-bar terpisah
 
 Saat mode block aktif dan keyguard terkunci, gesture dari status bar dimakan sebelum diteruskan ke SceneContainer atau shade controller.
+
+
+## v1.4 configuration fix
+
+Mode selection now uses the official libxposed `RemotePreferences` channel. Earlier builds used a custom exported `ContentProvider`; when SystemUI could not read it, the hook intentionally fell back to `REQUIRE_UNLOCK`, so selecting **Block shade** could appear to behave exactly like the first mode. v1.4 removes that provider bridge.

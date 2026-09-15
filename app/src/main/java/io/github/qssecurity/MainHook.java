@@ -3,7 +3,7 @@ package io.github.qssecurity;
 import android.app.KeyguardManager;
 import android.content.Context;
 import android.content.Intent;
-import android.os.Bundle;
+import android.content.SharedPreferences;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
@@ -36,7 +36,6 @@ import io.github.libxposed.api.XposedModuleInterface.PackageReadyParam;
 public final class MainHook extends XposedModule {
 
     private static final String TAG = "QSSecurity";
-    private static final long MODE_CACHE_MS = 500L;
     private static final long UNLOCK_WATCH_TIMEOUT_MS = 15_000L;
     private static final long UNLOCK_WATCH_INTERVAL_MS = 80L;
 
@@ -46,17 +45,40 @@ public final class MainHook extends XposedModule {
     private static volatile Object capturedActivityStarter;
 
     private static volatile int cachedMode = ModuleConfig.MODE_REQUIRE_UNLOCK;
-    private static volatile long cachedModeAt = Long.MIN_VALUE;
+    private static volatile SharedPreferences remotePreferences;
     private static volatile long lastUnlockRequestAt = 0L;
     private static volatile long blockedShadeGestureDownTime = -1L;
 
     /** A replay must not immediately get intercepted by another synchronous hook layer. */
     private static final ThreadLocal<Boolean> authenticatedReplay = new ThreadLocal<>();
 
+    private final SharedPreferences.OnSharedPreferenceChangeListener remotePreferenceListener =
+            (preferences, key) -> {
+                if (ModuleConfig.PREF_MODE.equals(key)) {
+                    int mode = normalizeMode(preferences.getInt(
+                            ModuleConfig.PREF_MODE, ModuleConfig.MODE_REQUIRE_UNLOCK));
+                    cachedMode = mode;
+                    log(Log.INFO, TAG, "Remote mode changed -> " + modeName(mode));
+                }
+            };
+
     @Override
     public void onModuleLoaded(ModuleLoadedParam param) {
         log(Log.INFO, TAG,
                 "Loaded. framework=" + getFrameworkName() + " api=" + getApiVersion());
+
+        try {
+            remotePreferences = getRemotePreferences(ModuleConfig.REMOTE_PREF_GROUP);
+            cachedMode = normalizeMode(remotePreferences.getInt(
+                    ModuleConfig.PREF_MODE, ModuleConfig.MODE_REQUIRE_UNLOCK));
+            remotePreferences.registerOnSharedPreferenceChangeListener(remotePreferenceListener);
+            log(Log.INFO, TAG, "RemotePreferences ready; mode=" + modeName(cachedMode));
+        } catch (Throwable t) {
+            remotePreferences = null;
+            cachedMode = ModuleConfig.MODE_REQUIRE_UNLOCK;
+            log(Log.ERROR, TAG,
+                    "RemotePreferences unavailable; temporary safe fallback=REQUIRE_UNLOCK", t);
+        }
     }
 
     /** Install only the ActivityStarter capture early; final action hooks use PackageReady's CL. */
@@ -796,13 +818,13 @@ public final class MainHook extends XposedModule {
 
     private boolean shouldRequireUnlock(Context context) {
         return context != null
-                && getMode(context) == ModuleConfig.MODE_REQUIRE_UNLOCK
+                && getMode() == ModuleConfig.MODE_REQUIRE_UNLOCK
                 && isKeyguardLocked(context);
     }
 
     private boolean shouldBlockShade(Context context) {
         return context != null
-                && getMode(context) == ModuleConfig.MODE_BLOCK_SHADE
+                && getMode() == ModuleConfig.MODE_BLOCK_SHADE
                 && isKeyguardLocked(context);
     }
 
@@ -819,38 +841,35 @@ public final class MainHook extends XposedModule {
         }
     }
 
-    private int getMode(Context context) {
-        long now = SystemClock.elapsedRealtime();
-        if (now - cachedModeAt < MODE_CACHE_MS) return cachedMode;
-
-        synchronized (MainHook.class) {
-            now = SystemClock.elapsedRealtime();
-            if (now - cachedModeAt < MODE_CACHE_MS) return cachedMode;
-
-            try {
-                Bundle result = context.getContentResolver().call(
-                        ModuleConfig.PROVIDER_URI,
-                        ModuleConfig.PROVIDER_METHOD_GET_MODE,
-                        null,
-                        null);
-                if (result != null) {
-                    int value = result.getInt(
-                            ModuleConfig.PROVIDER_RESULT_MODE,
-                            ModuleConfig.MODE_REQUIRE_UNLOCK);
-                    if (value == ModuleConfig.MODE_REQUIRE_UNLOCK
-                            || value == ModuleConfig.MODE_BLOCK_SHADE) {
-                        cachedMode = value;
-                    }
-                }
-            } catch (Throwable t) {
-                // Safe default: tile actions require unlock.
-                cachedMode = ModuleConfig.MODE_REQUIRE_UNLOCK;
-                log(Log.WARN, TAG, "Unable to read module mode; using REQUIRE_UNLOCK", t);
-            }
-
-            cachedModeAt = now;
+    /**
+     * Read configuration from libxposed RemotePreferences. This is the important v1.4 change:
+     * no cross-package ContentProvider call from SystemUI, and therefore no silent mode-2 ->
+     * mode-1 fallback when that provider bridge is unavailable on a ROM/user/SELinux setup.
+     */
+    private int getMode() {
+        SharedPreferences preferences = remotePreferences;
+        if (preferences == null) return cachedMode;
+        try {
+            int mode = normalizeMode(preferences.getInt(
+                    ModuleConfig.PREF_MODE, cachedMode));
+            cachedMode = mode;
+            return mode;
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "Unable to read RemotePreferences; keeping " + modeName(cachedMode), t);
             return cachedMode;
         }
+    }
+
+    private static int normalizeMode(int mode) {
+        return mode == ModuleConfig.MODE_BLOCK_SHADE
+                ? ModuleConfig.MODE_BLOCK_SHADE
+                : ModuleConfig.MODE_REQUIRE_UNLOCK;
+    }
+
+    private static String modeName(int mode) {
+        return mode == ModuleConfig.MODE_BLOCK_SHADE
+                ? "BLOCK_SHADE"
+                : "REQUIRE_UNLOCK";
     }
 
     private Context extractContext(Object object) {
