@@ -38,13 +38,15 @@ public final class QSApp extends Application implements XposedServiceHelper.OnSe
                     ModuleConfig.PREF_MODE, ModuleConfig.MODE_REQUIRE_UNLOCK));
             Set<String> whitelist = new HashSet<>(local.getStringSet(
                     ModuleConfig.PREF_WHITELIST, Collections.emptySet()));
+            boolean protectPower = local.getBoolean(ModuleConfig.PREF_PROTECT_POWER, true);
 
             remote.edit()
                     .putInt(ModuleConfig.PREF_MODE, localMode)
                     .putStringSet(ModuleConfig.PREF_WHITELIST, whitelist)
+                    .putBoolean(ModuleConfig.PREF_PROTECT_POWER, protectPower)
                     .apply();
             Log.i(TAG, "LSPosed service connected; settings synced. mode=" + localMode
-                    + " whitelist=" + whitelist);
+                    + " whitelist=" + whitelist + " protectPower=" + protectPower);
         } catch (Throwable t) {
             Log.e(TAG, "Unable to initialize libxposed RemotePreferences", t);
         }
@@ -101,6 +103,28 @@ public final class QSApp extends Application implements XposedServiceHelper.OnSe
             return true;
         } catch (Throwable t) {
             Log.e(TAG, "Unable to write whitelist=" + copy, t);
+            return false;
+        }
+    }
+
+    public static boolean getLocalPowerProtection(Context context) {
+        return context.getSharedPreferences(ModuleConfig.PREFS, MODE_PRIVATE)
+                .getBoolean(ModuleConfig.PREF_PROTECT_POWER, true);
+    }
+
+    public static boolean savePowerProtection(Context context, boolean enabled) {
+        context.getSharedPreferences(ModuleConfig.PREFS, MODE_PRIVATE)
+                .edit()
+                .putBoolean(ModuleConfig.PREF_PROTECT_POWER, enabled)
+                .apply();
+
+        SharedPreferences remote = remotePreferences;
+        if (remote == null) return false;
+        try {
+            remote.edit().putBoolean(ModuleConfig.PREF_PROTECT_POWER, enabled).apply();
+            return true;
+        } catch (Throwable t) {
+            Log.e(TAG, "Unable to write power protection=" + enabled, t);
             return false;
         }
     }

@@ -16,6 +16,7 @@ import android.widget.LinearLayout;
 import android.widget.RadioButton;
 import android.widget.RadioGroup;
 import android.widget.ScrollView;
+import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
@@ -31,6 +32,7 @@ public final class MainActivity extends Activity {
     private TextView frameworkStatus;
     private TextView hookStatus;
     private TextView modeStatus;
+    private Switch powerProtectionSwitch;
 
     private int dp(int value) {
         return Math.round(value * getResources().getDisplayMetrics().density);
@@ -147,6 +149,33 @@ public final class MainActivity extends Activity {
         modeCard.addView(group);
         root.addView(modeCard);
 
+        // Power protection card. Independent from the QS mode because physical power / external
+        // power-menu modules can otherwise bypass the shade policy.
+        LinearLayout powerCard = card();
+        powerCard.addView(sectionTitle("Power protection"));
+        TextView powerHint = text(
+                "Saat lock screen terkunci, tombol power di QS serta aksi Power off/Restart akan " +
+                "meminta fingerprint/PIN. AdvancedPowerMenu juga diproteksi untuk Recovery, " +
+                "Bootloader, Safe Mode, restart SystemUI/Zygote, dan aksi power lainnya.", 13);
+        powerHint.setTextColor(Color.rgb(100, 100, 110));
+        powerHint.setPadding(0, 0, 0, dp(8));
+        powerCard.addView(powerHint);
+
+        powerProtectionSwitch = new Switch(this);
+        powerProtectionSwitch.setText("Protect power actions while locked");
+        powerProtectionSwitch.setTextSize(15);
+        powerProtectionSwitch.setChecked(QSApp.getLocalPowerProtection(this));
+        powerProtectionSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            boolean pushed = QSApp.savePowerProtection(this, isChecked);
+            Toast.makeText(this,
+                    pushed
+                            ? (isChecked ? "Power protection aktif" : "Power protection nonaktif")
+                            : "Disimpan; LSPosed service belum terhubung",
+                    Toast.LENGTH_SHORT).show();
+        });
+        powerCard.addView(powerProtectionSwitch);
+        root.addView(powerCard);
+
         // Whitelist card. This only changes behavior when REQUIRE_UNLOCK is selected.
         LinearLayout whitelistCard = card();
         whitelistCard.addView(sectionTitle("Tile whitelist"));
@@ -175,10 +204,11 @@ public final class MainActivity extends Activity {
         LinearLayout infoCard = card();
         infoCard.addView(sectionTitle("Notes"));
         TextView note = text(
-                "• Scope LSPosed: System UI (com.android.systemui) saja.\n" +
-                "• Setelah update APK, restart SystemUI atau reboot sekali.\n" +
+                "• Scope LSPosed tetap hanya System UI (com.android.systemui).\n" +
+                "• Setelah update APK/modul, lakukan reboot penuh sekali agar hook baru benar-benar terpasang.\n" +
+                "• Emergency tetap dibiarkan tersedia; yang diproteksi adalah entry power QS dan aksi power/reboot.\n" +
                 "• Whitelist bersifat fail-secure: jika tile spec ROM tidak dikenali, tile tetap diproteksi.\n" +
-                "• Core hook mode Block shade dan replay unlock dipertahankan dari build stabil v1.4.2.",
+                "• Core hook Block shade dan replay unlock tetap dipertahankan dari build stabil sebelumnya.",
                 13);
         note.setTextColor(Color.rgb(75, 75, 85));
         infoCard.addView(note);

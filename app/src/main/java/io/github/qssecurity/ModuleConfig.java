@@ -9,6 +9,7 @@ public final class ModuleConfig {
     public static final String PREFS = "qs_security";
     public static final String PREF_MODE = "mode";
     public static final String PREF_WHITELIST = "tile_whitelist";
+    public static final String PREF_PROTECT_POWER = "protect_power";
     public static final String PREF_HOOK_LAST_SEEN = "hook_last_seen";
     public static final String PREF_HOOK_BOOT_COUNT = "hook_boot_count";
     public static final String PREF_HOOK_VERSION = "hook_version";
@@ -25,5 +26,5 @@ public final class ModuleConfig {
     /** Explicit heartbeat broadcast sent only by the hooked SystemUI process. */
     public static final String ACTION_HOOK_READY = APP_PACKAGE + ".action.HOOK_READY";
 
-    public static final String VERSION_NAME = "1.5.0";
+    public static final String VERSION_NAME = "1.6.0";
 }

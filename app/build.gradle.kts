@@ -10,8 +10,8 @@ android {
         applicationId = "io.github.qssecurity"
         minSdk = 36
         targetSdk = 36
-        versionCode = 8
-        versionName = "1.5.0"
+        versionCode = 9
+        versionName = "1.6.0"
     }
 
     buildTypes {

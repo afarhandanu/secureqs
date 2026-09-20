@@ -52,6 +52,7 @@ public final class MainHook extends XposedModule {
 
     private static volatile int cachedMode = ModuleConfig.MODE_REQUIRE_UNLOCK;
     private static volatile Set<String> cachedWhitelist = Collections.emptySet();
+    private static volatile boolean cachedProtectPower = true;
     private static volatile SharedPreferences remotePreferences;
     private static volatile long lastUnlockRequestAt = 0L;
     private static volatile long blockedShadeGestureDownTime = -1L;
@@ -70,6 +71,9 @@ public final class MainHook extends XposedModule {
                 } else if (ModuleConfig.PREF_WHITELIST.equals(key)) {
                     cachedWhitelist = readWhitelist(preferences);
                     log(Log.INFO, TAG, "Remote whitelist changed -> " + cachedWhitelist);
+                } else if (ModuleConfig.PREF_PROTECT_POWER.equals(key)) {
+                    cachedProtectPower = preferences.getBoolean(ModuleConfig.PREF_PROTECT_POWER, true);
+                    log(Log.INFO, TAG, "Remote power protection changed -> " + cachedProtectPower);
                 }
             };
 
@@ -83,13 +87,15 @@ public final class MainHook extends XposedModule {
             cachedMode = normalizeMode(remotePreferences.getInt(
                     ModuleConfig.PREF_MODE, ModuleConfig.MODE_REQUIRE_UNLOCK));
             cachedWhitelist = readWhitelist(remotePreferences);
+            cachedProtectPower = remotePreferences.getBoolean(ModuleConfig.PREF_PROTECT_POWER, true);
             remotePreferences.registerOnSharedPreferenceChangeListener(remotePreferenceListener);
             log(Log.INFO, TAG, "RemotePreferences ready; mode=" + modeName(cachedMode)
-                    + " whitelist=" + cachedWhitelist);
+                    + " whitelist=" + cachedWhitelist + " protectPower=" + cachedProtectPower);
         } catch (Throwable t) {
             remotePreferences = null;
             cachedMode = ModuleConfig.MODE_REQUIRE_UNLOCK;
             cachedWhitelist = Collections.emptySet();
+            cachedProtectPower = true;
             log(Log.ERROR, TAG,
                     "RemotePreferences unavailable; temporary safe fallback=REQUIRE_UNLOCK", t);
         }
@@ -123,6 +129,7 @@ public final class MainHook extends XposedModule {
             installNewArchitectureHooks(cl);
             installLegacyTileHooks(cl);
             installShadeHooks(cl);
+            installPowerProtectionHooks(cl);
             sendHookHeartbeat();
             log(Log.INFO, TAG, "Hook installation complete");
         } catch (Throwable t) {
@@ -207,6 +214,182 @@ public final class MainHook extends XposedModule {
                 log(Log.DEBUG, TAG, "ActivityStarter capture unavailable: " + name, t);
             }
         }
+    }
+
+    /**
+     * Protect non-tile power entry points while the keyguard is locked.
+     *
+     * This intentionally stays in the SystemUI process so the stable shade/tile hooks do not need
+     * a system_server scope. There are three layers:
+     *  1) QS footer power button -> authenticate before opening the power menu.
+     *  2) Stock GlobalActions destructive actions -> authenticate before Power off / Restart.
+     *  3) AdvancedPowerMenu compatibility -> gate its SHOW/RUN_POWER broadcasts, including
+     *     recovery, bootloader, safe mode, SystemUI/Zygote restart and power off.
+     */
+    private void installPowerProtectionHooks(ClassLoader cl) {
+        int total = 0;
+
+        // Android 16 QS footer. This is the cleanest gate for the power icon shown in expanded QS.
+        String[] footerInteractors = {
+                "com.android.systemui.qs.footer.domain.interactor.FooterActionsInteractorImpl"
+        };
+        for (String name : footerInteractors) {
+            try {
+                Class<?> clazz = cl.loadClass(name);
+                for (Method m : clazz.getDeclaredMethods()) {
+                    if (!m.getName().equals("showPowerMenuDialog") || m.getReturnType() != void.class) {
+                        continue;
+                    }
+                    hookPowerActionMethod(m, cl, "QS_POWER_MENU");
+                    total++;
+                }
+            } catch (Throwable t) {
+                log(Log.DEBUG, TAG, "QS footer power interactor unavailable: " + name, t);
+            }
+        }
+
+        // Some ROM revisions keep the click callback as a real method on the ViewModel.
+        try {
+            Class<?> clazz = cl.loadClass(
+                    "com.android.systemui.qs.footer.ui.viewmodel.FooterActionsViewModel");
+            for (Method m : clazz.getDeclaredMethods()) {
+                if (!m.getName().equals("onPowerButtonClicked") || m.getReturnType() != void.class) {
+                    continue;
+                }
+                hookPowerActionMethod(m, cl, "QS_POWER_VM");
+                total++;
+            }
+        } catch (Throwable t) {
+            log(Log.DEBUG, TAG, "QS footer ViewModel power hook unavailable", t);
+        }
+
+        // Stock Android/Lineage global actions. Keep the menu (and Emergency/Lockdown) available,
+        // but require authentication before destructive actions themselves execute.
+        String[] stockActionClasses = {
+                "com.android.systemui.globalactions.GlobalActionsDialogLite$ShutDownAction",
+                "com.android.systemui.globalactions.GlobalActionsDialogLite$RestartAction"
+        };
+        for (String name : stockActionClasses) {
+            try {
+                Class<?> clazz = cl.loadClass(name);
+                for (Method m : clazz.getDeclaredMethods()) {
+                    String n = m.getName();
+                    if (!(n.equals("onPress") || n.equals("onLongPress"))) continue;
+                    Class<?> rt = m.getReturnType();
+                    if (!(rt == void.class || rt == boolean.class || rt == Boolean.class)) continue;
+                    hookPowerActionMethod(m, cl, "STOCK_GLOBAL_ACTION");
+                    total++;
+                }
+            } catch (Throwable t) {
+                log(Log.DEBUG, TAG, "Stock global action class unavailable: " + name, t);
+            }
+        }
+
+        // Also cover direct framework power calls made from SystemUI-side extensions/modules.
+        // This is a fallback for implementations that do not go through GlobalActionsDialogLite.
+        try {
+            Class<?> powerManager = cl.loadClass("android.os.PowerManager");
+            for (Method m : powerManager.getDeclaredMethods()) {
+                String n = m.getName();
+                if (!(n.equals("reboot") || n.equals("rebootSafeMode") || n.equals("shutdown"))) {
+                    continue;
+                }
+                if (m.getReturnType() != void.class) continue;
+                hookPowerActionMethod(m, cl, "POWER_MANAGER");
+                total++;
+            }
+        } catch (Throwable t) {
+            log(Log.DEBUG, TAG, "PowerManager guard unavailable", t);
+        }
+
+        // AdvancedPowerMenu 2.x uses explicit broadcasts from its SystemUI-side dialog to its
+        // system_server-side receiver. Gating the broadcasts avoids any class-loader dependency on
+        // another LSPosed module and covers Recovery/Bootloader/Safe Mode/SystemUI/Zygote/etc.
+        try {
+            Class<?> contextImpl = cl.loadClass("android.app.ContextImpl");
+            for (Method m : contextImpl.getDeclaredMethods()) {
+                if (!m.getName().startsWith("sendBroadcast") || m.getReturnType() != void.class) {
+                    continue;
+                }
+                int intentIndex = findIntentParameter(m);
+                if (intentIndex < 0) continue;
+                makeAccessible(m);
+                final int idx = intentIndex;
+                hook(m).intercept(chain -> {
+                    if (Boolean.TRUE.equals(authenticatedReplay.get())) {
+                        return chain.proceed();
+                    }
+                    Object value = chain.getArgs().get(idx);
+                    if (!(value instanceof Intent)) return chain.proceed();
+                    Intent intent = (Intent) value;
+                    String action = intent.getAction();
+                    if (!isAdvancedPowerMenuAction(action)) return chain.proceed();
+
+                    Context context = extractContext(chain.getThisObject());
+                    if (context == null) context = systemUiContext;
+                    rememberContext(context);
+                    if (!shouldProtectPower(context)) return chain.proceed();
+
+                    log(Log.INFO, TAG, "BLOCK AdvancedPowerMenu broadcast action=" + action);
+                    long now = SystemClock.elapsedRealtime();
+                    if (now - lastUnlockRequestAt >= 700L) {
+                        lastUnlockRequestAt = now;
+                        Object[] args = chain.getArgs().toArray();
+                        requestUnlockAndReplay(cl, context, chain.getThisObject(), m, args);
+                    }
+                    return null;
+                });
+                total++;
+            }
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "AdvancedPowerMenu broadcast guard unavailable", t);
+        }
+
+        log(Log.INFO, TAG, "Power protection hooks=" + total);
+    }
+
+    private void hookPowerActionMethod(Method method, ClassLoader cl, String path) {
+        makeAccessible(method);
+        hook(method).intercept(chain -> {
+            if (Boolean.TRUE.equals(authenticatedReplay.get())) {
+                return chain.proceed();
+            }
+
+            Object target = chain.getThisObject();
+            Context context = extractContext(target);
+            if (context == null) context = systemUiContext;
+            rememberContext(context);
+            if (!shouldProtectPower(context)) {
+                return chain.proceed();
+            }
+
+            log(Log.INFO, TAG, "BLOCK POWER " + path + " "
+                    + method.getDeclaringClass().getSimpleName() + "#" + method.getName());
+
+            long now = SystemClock.elapsedRealtime();
+            if (now - lastUnlockRequestAt >= 700L) {
+                lastUnlockRequestAt = now;
+                Object[] args = chain.getArgs().toArray();
+                requestUnlockAndReplay(cl, context, target, method, args);
+            }
+
+            Class<?> rt = method.getReturnType();
+            if (rt == boolean.class || rt == Boolean.class) return false;
+            return null;
+        });
+    }
+
+    private boolean isAdvancedPowerMenuAction(String action) {
+        return "com.sui.advancedpowermenu.action.SHOW".equals(action)
+                || "com.sui.advancedpowermenu.action.RUN_POWER".equals(action);
+    }
+
+    private int findIntentParameter(Method method) {
+        Class<?>[] types = method.getParameterTypes();
+        for (int i = 0; i < types.length; i++) {
+            if (Intent.class.isAssignableFrom(types[i])) return i;
+        }
+        return -1;
     }
 
     /** Android 16 new QS architecture. This is the critical fix for migrated tiles. */
@@ -342,10 +525,10 @@ public final class MainHook extends XposedModule {
 
                 makeAccessible(method);
                 method.invoke(target, args);
-                log(Log.INFO, TAG, "Authenticated QS action replayed: "
+                log(Log.INFO, TAG, "Authenticated protected action replayed: "
                         + method.getDeclaringClass().getSimpleName() + "#" + method.getName());
             } catch (Throwable t) {
-                log(Log.ERROR, TAG, "Authenticated QS replay failed", t);
+                log(Log.ERROR, TAG, "Authenticated protected-action replay failed", t);
             } finally {
                 authenticatedReplay.remove();
             }
@@ -392,13 +575,13 @@ public final class MainHook extends XposedModule {
 
                 Context context = initialContext != null ? initialContext : systemUiContext;
                 if (context != null && !isKeyguardLocked(context)) {
-                    log(Log.INFO, TAG, "UNLOCK detected by watcher; replaying pending QS action");
+                    log(Log.INFO, TAG, "UNLOCK detected by watcher; replaying protected action");
                     replayOnce.run();
                     return;
                 }
 
                 if (SystemClock.elapsedRealtime() >= deadline) {
-                    log(Log.INFO, TAG, "Pending QS replay expired (unlock cancelled/timed out)");
+                    log(Log.INFO, TAG, "Pending protected action expired (unlock cancelled/timed out)");
                     return;
                 }
 
@@ -835,6 +1018,23 @@ public final class MainHook extends XposedModule {
         float y = event.getRawY();
         if (y < 0f) y = event.getY();
         return y <= thresholdPx;
+    }
+
+    private boolean shouldProtectPower(Context context) {
+        return context != null && getPowerProtectionEnabled() && isKeyguardLocked(context);
+    }
+
+    private boolean getPowerProtectionEnabled() {
+        SharedPreferences preferences = remotePreferences;
+        if (preferences == null) return cachedProtectPower;
+        try {
+            boolean enabled = preferences.getBoolean(ModuleConfig.PREF_PROTECT_POWER, cachedProtectPower);
+            cachedProtectPower = enabled;
+            return enabled;
+        } catch (Throwable t) {
+            log(Log.WARN, TAG, "Unable to read power protection; keeping " + cachedProtectPower, t);
+            return cachedProtectPower;
+        }
     }
 
     private boolean shouldRequireUnlock(Context context) {
